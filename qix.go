@@ -300,18 +300,23 @@ func (b *Builder) WhereIn(column string, values ...interface{}) *Builder {
 		return b
 	}
 
+	// Create placeholders array
 	placeholders := make([]string, len(values))
 	for i := range values {
 		placeholders[i] = "?"
 		b.bindings = append(b.bindings, values[i])
 	}
 
-	b.wheres = append(b.wheres, where{
+	// Create the where clause with the correct parentheses treatment
+	whereClause := where{
 		column:   column,
 		operator: "IN",
-		value:    "(" + strings.Join(placeholders, ", ") + ")",
+		value:    strings.Join(placeholders, ", "), // Remove parentheses here
 		boolean:  "AND",
-	})
+	}
+
+	// Add to wheres slice
+	b.wheres = append(b.wheres, whereClause)
 	return b
 }
 
@@ -337,7 +342,7 @@ func (b *Builder) WhereNotIn(column string, values ...interface{}) *Builder {
 	b.wheres = append(b.wheres, where{
 		column:   column,
 		operator: "NOT IN",
-		value:    "(" + strings.Join(placeholders, ", ") + ")",
+		value:    strings.Join(placeholders, ", "),
 		boolean:  "AND",
 	})
 	return b
@@ -444,9 +449,9 @@ func (b *Builder) WhereMonth(column string, operator string, values ...interface
 		valueStr, bindings = createPlaceholders(values)
 	}
 
-	if operator == "IN" {
-		valueStr = "(" + valueStr + ")"
-	}
+	// if operator == "IN" {
+	// 	valueStr = "(" + valueStr + ")"
+	// }
 
 	b.wheres = append(b.wheres, where{
 		column:   "MONTH(" + column + ")",
@@ -498,6 +503,7 @@ func (b *Builder) OrWhereColumn(column1 string, operator string, column2 string)
 		operator: operator,
 		value:    column2,
 		boolean:  "OR",
+		isColumn: true,
 	})
 	return b
 }
@@ -584,16 +590,28 @@ func (b *Builder) whereSQL() string {
 			whereClauses = append(whereClauses, where.boolean)
 		}
 
-		if where.operator == "" && where.value == "" {
+		switch {
+		case where.operator == "" && where.value == "":
 			// For raw or nested conditions
 			whereClauses = append(whereClauses, where.column)
-		} else if where.value == "NULL" {
+
+		case where.value == "NULL":
 			// For IS NULL conditions
 			whereClauses = append(whereClauses, fmt.Sprintf("%v %v %v", where.column, where.operator, where.value))
-		} else if where.isColumn {
+
+		case where.isColumn:
 			// For column comparisons
 			whereClauses = append(whereClauses, fmt.Sprintf("%v %v %v", where.column, where.operator, where.value))
-		} else {
+
+		case where.operator == "IN" || where.operator == "NOT IN" || where.operator == "EXISTS":
+			// Special handling for IN operator
+			whereClauses = append(whereClauses, fmt.Sprintf("%v %v (%v)", where.column, where.operator, where.value))
+
+		case where.operator == "BETWEEN":
+			// Special handling for BETWEEN operator
+			whereClauses = append(whereClauses, fmt.Sprintf("%v %v %v", where.column, where.operator, where.value))
+
+		default:
 			// For normal conditions
 			whereClauses = append(whereClauses, where.column+" "+where.operator+" ?")
 		}
