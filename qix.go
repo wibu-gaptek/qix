@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"strings"
+	"time"
 )
 
 // DB interface untuk memudahkan testing dan mendukung berbagai database driver
@@ -21,17 +23,20 @@ type TxDB interface {
 
 // Builder represents the main query builder struct
 type Builder struct {
-	table    string
-	columns  []string
-	wheres   []where
-	joins    []join
-	groups   []string
-	havings  []having
-	orders   []order
-	limit    *int
-	offset   *int
-	bindings []interface{}
-	db       DB // tambahkan field db
+	table               string
+	columns             []string
+	wheres              []where
+	joins               []join
+	groups              []string
+	havings             []having
+	orders              []order
+	limit               *int
+	offset              *int
+	bindings            []interface{}
+	db                  DB // tambahkan field db
+	unions              []union
+	beforeQueryHandlers []QueryEventHandler
+	afterQueryHandlers  []QueryEventHandler
 }
 
 // where represents a where clause condition
@@ -215,6 +220,27 @@ func (b *Builder) SubSelect(subQuery *Builder, alias string) *Builder {
 
 // ToSQL converts the query builder to SQL string
 func (b *Builder) ToSQL() string {
+	var query strings.Builder
+
+	// Build base query
+	query.WriteString(b.buildBaseQuery())
+
+	// Add UNION clauses
+	for _, union := range b.unions {
+		if union.typ == UnionAll {
+			query.WriteString(" UNION ALL ")
+		} else {
+			query.WriteString(" UNION ")
+		}
+		query.WriteString(union.query.buildBaseQuery())
+		b.bindings = append(b.bindings, union.query.bindings...)
+	}
+
+	return query.String()
+}
+
+// buildBaseQuery builds the base SELECT query without UNIONs
+func (b *Builder) buildBaseQuery() string {
 	var query strings.Builder
 
 	// Build SELECT clause
@@ -788,10 +814,13 @@ func (b *Builder) WhereRaw(sql string, bindings ...interface{}) *Builder {
 	return b
 }
 
+// QueryFunc represents a function that modifies the query builder
+type QueryFunc func(*Builder)
+
 // WhereFunc adds a WHERE clause using a callback function
-func (b *Builder) WhereFunc(callback func(*Builder)) *Builder {
+func (b *Builder) WhereFunc(fn QueryFunc) *Builder {
 	subBuilder := New(b.db)
-	callback(subBuilder)
+	fn(subBuilder)
 
 	// Merge conditions from subBuilder
 	b.wheres = append(b.wheres, subBuilder.wheres...)
@@ -800,9 +829,9 @@ func (b *Builder) WhereFunc(callback func(*Builder)) *Builder {
 }
 
 // OrWhereFunc adds an OR WHERE clause using a callback function
-func (b *Builder) OrWhereFunc(callback func(*Builder)) *Builder {
+func (b *Builder) OrWhereFunc(fn QueryFunc) *Builder {
 	subBuilder := New(b.db)
-	callback(subBuilder)
+	fn(subBuilder)
 
 	// Convert first condition to OR
 	if len(subBuilder.wheres) > 0 {
@@ -810,6 +839,51 @@ func (b *Builder) OrWhereFunc(callback func(*Builder)) *Builder {
 	}
 
 	b.wheres = append(b.wheres, subBuilder.wheres...)
+	b.bindings = append(b.bindings, subBuilder.bindings...)
+	return b
+}
+
+// JoinFunc adds a JOIN clause using a callback function
+func (b *Builder) JoinFunc(table string, fn QueryFunc) *Builder {
+	subBuilder := New(b.db)
+	fn(subBuilder)
+
+	// Convert WHERE conditions to JOIN conditions
+	var conditions []string
+	for _, where := range subBuilder.wheres {
+		if where.isColumn {
+			conditions = append(conditions, fmt.Sprintf("%v %v %v",
+				where.column, where.operator, where.value))
+		} else {
+			conditions = append(conditions, fmt.Sprintf("%v %v ?",
+				where.column, where.operator))
+			b.bindings = append(b.bindings, where.value)
+		}
+	}
+
+	joinCondition := strings.Join(conditions, " AND ")
+	b.joins = append(b.joins, join{
+		table:     table,
+		condition: joinCondition,
+		joinType:  "INNER",
+	})
+
+	return b
+}
+
+// HavingFunc adds a HAVING clause using a callback function
+func (b *Builder) HavingFunc(fn QueryFunc) *Builder {
+	subBuilder := New(b.db)
+	fn(subBuilder)
+
+	for _, where := range subBuilder.wheres {
+		b.havings = append(b.havings, having{
+			column:   where.column,
+			operator: where.operator,
+			value:    where.value,
+			boolean:  where.boolean,
+		})
+	}
 	b.bindings = append(b.bindings, subBuilder.bindings...)
 	return b
 }
@@ -830,4 +904,213 @@ func (b *Builder) WhereNested(callback func(*Builder)) *Builder {
 	}
 
 	return b
+}
+
+// UnionType represents the type of UNION operation
+type UnionType int
+
+const (
+	UnionNormal UnionType = iota
+	UnionAll
+)
+
+// union represents a UNION query
+type union struct {
+	query *Builder
+	typ   UnionType
+}
+
+// Union adds a UNION clause
+func (b *Builder) Union(query *Builder) *Builder {
+	b.unions = append(b.unions, union{
+		query: query,
+		typ:   UnionNormal,
+	})
+	return b
+}
+
+// UnionAll adds a UNION ALL clause
+func (b *Builder) UnionAll(query *Builder) *Builder {
+	b.unions = append(b.unions, union{
+		query: query,
+		typ:   UnionAll,
+	})
+	return b
+}
+
+// When adds conditions based on a boolean value
+func (b *Builder) When(condition bool, callback func(*Builder)) *Builder {
+	if condition {
+		callback(b)
+	}
+	return b
+}
+
+// WhenNot adds conditions when boolean is false
+func (b *Builder) WhenNot(condition bool, callback func(*Builder)) *Builder {
+	if !condition {
+		callback(b)
+	}
+	return b
+}
+
+// Unless is an alias for WhenNot
+func (b *Builder) Unless(condition bool, callback func(*Builder)) *Builder {
+	return b.WhenNot(condition, callback)
+}
+
+// Debug returns the query with interpolated values
+func (b *Builder) Debug() string {
+	sql := b.ToSQL()
+	for _, binding := range b.bindings {
+		sql = strings.Replace(sql, "?", fmt.Sprintf("%v", binding), 1)
+	}
+	return sql
+}
+
+// Explain returns the query execution plan
+func (b *Builder) Explain() (string, error) {
+	ctx := context.Background()
+	rows, err := b.db.QueryContext(ctx, "EXPLAIN "+b.ToSQL(), b.bindings...)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	var explanation strings.Builder
+	cols, err := rows.Columns()
+	if err != nil {
+		return "", err
+	}
+
+	vals := make([]interface{}, len(cols))
+	for i := range vals {
+		vals[i] = new(sql.RawBytes)
+	}
+
+	for rows.Next() {
+		if err := rows.Scan(vals...); err != nil {
+			return "", err
+		}
+		for i, col := range cols {
+			explanation.WriteString(fmt.Sprintf("%s: %s\n", col, vals[i].(*sql.RawBytes)))
+		}
+	}
+
+	return explanation.String(), nil
+}
+
+// GetBindings returns the current query bindings
+func (b *Builder) GetBindings() []interface{} {
+	return b.bindings
+}
+
+// Schema operations
+type SchemaBuilder struct {
+	columns map[string]string
+	indexes map[string][]string
+}
+
+func NewSchemaBuilder() *SchemaBuilder {
+	return &SchemaBuilder{
+		columns: make(map[string]string),
+		indexes: make(map[string][]string),
+	}
+}
+
+// CreateTable creates a new table
+func (b *Builder) CreateTable(name string, callback func(*SchemaBuilder)) error {
+	schema := NewSchemaBuilder()
+	callback(schema)
+
+	var cols []string
+	for col, typ := range schema.columns {
+		cols = append(cols, fmt.Sprintf("%s %s", col, typ))
+	}
+
+	query := fmt.Sprintf("CREATE TABLE %s (\n%s\n)", name, strings.Join(cols, ",\n"))
+	_, err := b.db.ExecContext(context.Background(), query)
+	return err
+}
+
+// Query events
+type QueryEvent struct {
+	SQL      string
+	Bindings []interface{}
+	Duration time.Duration
+}
+
+type QueryEventHandler func(*QueryEvent)
+
+// BeforeQuery adds a before query event handler
+func (b *Builder) BeforeQuery(handler QueryEventHandler) *Builder {
+	b.beforeQueryHandlers = append(b.beforeQueryHandlers, handler)
+	return b
+}
+
+// AfterQuery adds an after query event handler
+func (b *Builder) AfterQuery(handler QueryEventHandler) *Builder {
+	b.afterQueryHandlers = append(b.afterQueryHandlers, handler)
+	return b
+}
+
+// Batch processing
+type Paginator struct {
+	Items       []map[string]interface{}
+	Total       int64
+	PerPage     int
+	CurrentPage int
+	LastPage    int
+}
+
+// Paginate returns paginated results
+func (b *Builder) Paginate(page, perPage int) (*Paginator, error) {
+	ctx := context.Background()
+
+	// Get total count
+	countBuilder := *b
+	count, err := countBuilder.Count("*").Get(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var total int64
+
+	// count total
+	if count.Next() {
+		count.Scan(&total)
+	}
+
+	// Get paginated results
+	offset := (page - 1) * perPage
+	rows, err := b.Limit(perPage).Offset(offset).Get(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var items []map[string]interface{}
+	cols, _ := rows.Columns()
+	for rows.Next() {
+		item := make(map[string]interface{})
+		vals := make([]interface{}, len(cols))
+		for i := range vals {
+			vals[i] = new(interface{})
+		}
+		if err := rows.Scan(vals...); err != nil {
+			return nil, err
+		}
+		for i, col := range cols {
+			item[col] = *vals[i].(*interface{})
+		}
+		items = append(items, item)
+	}
+
+	return &Paginator{
+		Items:       items,
+		Total:       total,
+		PerPage:     perPage,
+		CurrentPage: page,
+		LastPage:    int(math.Ceil(float64(total) / float64(perPage))),
+	}, nil
 }

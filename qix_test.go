@@ -575,3 +575,146 @@ func TestAdvancedWhere(t *testing.T) {
 		})
 	}
 }
+
+func TestQueryFunctions(t *testing.T) {
+	db := &MockDB{}
+	tests := []struct {
+		name     string
+		build    func() *Builder
+		expected string
+	}{
+		{
+			name: "WhereFunc Complex Condition",
+			build: func() *Builder {
+				return New(db).Table("users").WhereFunc(func(q *Builder) {
+					q.Where("age", ">", 18).
+						Where("status", "=", "active").
+						OrWhere("role", "=", "admin")
+				})
+			},
+			expected: "SELECT * FROM users WHERE age > ? AND status = ? OR role = ?",
+		},
+		{
+			name: "OrWhereFunc Group",
+			build: func() *Builder {
+				return New(db).Table("users").
+					Where("department", "=", "IT").
+					OrWhereFunc(func(q *Builder) {
+						q.Where("age", ">", 25).
+							Where("experience", ">", 5)
+					})
+			},
+			expected: "SELECT * FROM users WHERE department = ? OR age > ? AND experience > ?",
+		},
+		{
+			name: "JoinFunc Complex Condition",
+			build: func() *Builder {
+				return New(db).Table("users").
+					JoinFunc("orders", func(q *Builder) {
+						q.WhereColumn("users.id", "=", "orders.user_id").
+							Where("orders.status", "=", "completed")
+					})
+			},
+			expected: "SELECT * FROM users INNER JOIN orders ON users.id = orders.user_id AND orders.status = ?",
+		},
+		{
+			name: "HavingFunc Complex Condition",
+			build: func() *Builder {
+				return New(db).Table("users").
+					Select("department", "AVG(salary) as avg_salary").
+					GroupBy("department").
+					HavingFunc(func(q *Builder) {
+						q.Where("avg_salary", ">", 50000).
+							Where("COUNT(*)", ">", 5)
+					})
+			},
+			expected: "SELECT department, AVG(salary) as avg_salary FROM users GROUP BY department HAVING avg_salary > ? AND COUNT(*) > ?",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sql := tt.build().ToSQL()
+			if sql != tt.expected {
+				t.Errorf("Expected SQL: %s\nGot: %s", tt.expected, sql)
+			}
+		})
+	}
+}
+
+func TestUnionQueries(t *testing.T) {
+	db := &MockDB{}
+	tests := []struct {
+		name     string
+		build    func() *Builder
+		expected string
+	}{
+		{
+			name: "Simple Union",
+			build: func() *Builder {
+				users := New(db).Table("users").Where("role", "=", "admin")
+				staff := New(db).Table("staff").Where("department", "=", "IT")
+				return users.Union(staff)
+			},
+			expected: "SELECT * FROM users WHERE role = ? UNION SELECT * FROM staff WHERE department = ?",
+		},
+		{
+			name: "Union All",
+			build: func() *Builder {
+				q1 := New(db).Table("orders").Where("status", "=", "pending")
+				q2 := New(db).Table("archived_orders").Where("status", "=", "pending")
+				return q1.UnionAll(q2)
+			},
+			expected: "SELECT * FROM orders WHERE status = ? UNION ALL SELECT * FROM archived_orders WHERE status = ?",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sql := tt.build().ToSQL()
+			if sql != tt.expected {
+				t.Errorf("Expected SQL: %s\nGot: %s", tt.expected, sql)
+			}
+		})
+	}
+}
+
+func TestConditionalQueries(t *testing.T) {
+	db := &MockDB{}
+	hasRole := true
+	hasDept := false
+
+	builder := New(db).Table("users").
+		When(hasRole, func(q *Builder) {
+			q.Where("role", "=", "admin")
+		}).
+		When(hasDept, func(q *Builder) {
+			q.Where("department", "=", "IT")
+		})
+
+	expected := "SELECT * FROM users WHERE role = ?"
+	sql := builder.ToSQL()
+	t.Logf("Query: %s", sql)
+	if sql != expected {
+		t.Errorf("Expected SQL: %s\nGot: %s", expected, sql)
+	}
+}
+
+func TestPagination(t *testing.T) {
+	db := &MockDB{
+		queryFunc: func(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+			// Mock implementation
+			return nil, nil
+		},
+	}
+
+	builder := New(db).Table("users").Where("active", "=", true)
+	paginator, err := builder.Paginate(1, 20)
+	if err != nil {
+		t.Errorf("Expected no error, got %v", err)
+	}
+
+	if paginator.PerPage != 20 {
+		t.Errorf("Expected per page to be 20, got %d", paginator.PerPage)
+	}
+}
